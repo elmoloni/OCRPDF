@@ -1,7 +1,8 @@
 """Notetaker: record a call on two tracks (your mic / PC sound) and transcribe it with speaker labels.
 
-Each recording goes to <output folder>/<YYYY MM DD - title>/ with mic.wav, system.wav,
-transcript.md and transcript.json. Transcription runs transcribe.py in a child process.
+Each recording goes to <output folder>/<title>/ with "<title> - mic.wav", "<title> - system.wav",
+"<title>.md" and "<title>.json"; the title is read when the recording ends.
+Transcription runs transcribe.py in a child process.
 """
 from __future__ import annotations
 
@@ -265,12 +266,10 @@ class App:
         self.start_record()
 
     def start_record(self) -> None:
+        """Record into a temporary folder; it gets its name from the Title field when the recording ends."""
         self.remember()
-        title = self.v_title.get().strip()
-        if not title or title == date_prefix().strip():
-            title = datetime.now().strftime("%Y %m %d - %H%M")
-        title = re.sub(r'[<>:"/\\|?*]+', "", title).strip().rstrip(".")
-        folder = unique_folder(Path(self.v_dir.get()), title)
+        self.rec_started = datetime.now()
+        folder = unique_folder(Path(self.v_dir.get()), self.rec_started.strftime("%Y %m %d - %H%M (recording)"))
         try:
             self.rec = DualRecorder(folder, self.v_mic.get() or None, self.v_out.get() or None)
             self.rec.start()
@@ -278,29 +277,44 @@ class App:
             self.rec = None
             messagebox.showerror("Notetaker", f"Could not start recording:\n{e}")
             return
-        self.rec_title = folder.name
-        self.v_title.set(date_prefix())  # ready for the next recording's title
-        self.ent_title.icursor("end")
         self.btn_rec.configure(text="●  New recording")
         self.btn_stop.configure(state="normal")
-        self.lbl_rec.configure(text=f"Recording: {folder.name}")
-        self.log(f"Recording to {folder}\n  mic: {self.rec.devices['mic']}\n  PC sound: {self.rec.devices['system']}")
+        self.lbl_rec.configure(text=f"Recording since {self.rec_started:%H:%M}. The title is taken when you stop.")
+        self.log(f"Recording ({folder.name})\n  mic: {self.rec.devices['mic']}\n  PC sound: {self.rec.devices['system']}")
 
     def stop_record(self) -> None:
         if not self.rec:
             return
-        mic, system = self.rec.stop()
-        self.rec = None
+        mic, system = self.finish_recording()
         self.btn_rec.configure(text="●  Record")
         self.btn_stop.configure(state="disabled")
         self.lbl_rec.configure(text="")
         self.lbl_time.configure(text="00:00:00")
         self.m_mic["value"] = self.m_sys["value"] = 0
-        self.log(f"Saved {mic.parent.name}")
         if self.v_auto.get():
-            self.queue_two_track(mic, system, self.rec_title)
+            self.queue_two_track(mic, system, mic.parent.name)
         else:
             self.lbl_status.configure(text=f"Recording saved in {mic.parent}")
+
+    def finish_recording(self) -> tuple[Path, Path]:
+        """Stop, then name folder and files after the Title field as it is now; reset the field for the next one."""
+        mic, system = self.rec.stop()
+        self.rec = None
+        title = re.sub(r'[<>:"/\\|?*]+', "", self.v_title.get()).strip().rstrip(".")
+        if not title or title == date_prefix().strip():
+            title = self.rec_started.strftime("%Y %m %d - %H%M")
+        folder = mic.parent
+        try:
+            folder = folder.rename(unique_folder(folder.parent, title))
+            mic = (folder / mic.name).rename(folder / f"{folder.name} - mic.wav")
+            system = (folder / system.name).rename(folder / f"{folder.name} - system.wav")
+        except OSError as e:  # e.g. a file opened by another program; keep whatever names stuck
+            self.log(f"Could not rename the recording to '{title}': {e}")
+            mic, system = next(folder.glob("*mic.wav")), next(folder.glob("*system.wav"))
+        self.v_title.set(date_prefix())  # ready for the next recording's title
+        self.ent_title.icursor("end")
+        self.log(f"Saved {folder.name}")
+        return mic, system
 
     # ------------------------------------------------------------------ transcription
     def common_args(self, speakers: str) -> list[str]:
@@ -313,7 +327,7 @@ class App:
         args += self.common_args(self.v_spk.get())
         if title:
             args += ["--title", title]
-        self.enqueue(args, mic.parent / "transcript.json")
+        self.enqueue(args, mic.parent / f"{transcribe.session_base(mic)}.json")
 
     def transcribe_file(self) -> None:
         path = filedialog.askopenfilename(
@@ -322,10 +336,14 @@ class App:
         if not path:
             return
         p = Path(path)
-        # A Notetaker session folder: redo it in two-track mode
-        if p.name.lower() in ("mic.wav", "system.wav") and (p.parent / "mic.wav").exists() and (p.parent / "system.wav").exists():
-            self.queue_two_track(p.parent / "mic.wav", p.parent / "system.wav")
-            return
+        # A Notetaker recording ("<title> - mic.wav" / "<title> - system.wav"): redo it in two-track mode
+        m = re.match(r"^(.*?)(?:\s*-\s*)?(mic|system)\.wav$", p.name, re.I)
+        if m:
+            stem = m.group(1).strip()
+            mic, system = (p.with_name(f"{stem} - {k}.wav" if stem else f"{k}.wav") for k in ("mic", "system"))
+            if mic.exists() and system.exists():
+                self.queue_two_track(mic, system, p.parent.name)
+                return
         n = simpledialog.askstring("Speakers", "How many different voices are in this file?\n(leave empty = detect automatically)",
                                    parent=self.root)
         if n is None:
@@ -452,10 +470,10 @@ class App:
 
     def on_close(self) -> None:
         if self.rec:
-            if not messagebox.askyesno("Notetaker", "A recording is running. Stop and save it, then quit?"):
+            if not messagebox.askyesno("Notetaker", "A recording is running. Stop and save it, then quit?\n"
+                                                    "(You can transcribe it later with 'Transcribe file...'.)"):
                 return
-            self.rec.stop()
-            self.rec = None
+            self.finish_recording()
         if self.proc and self.proc.poll() is None:
             if not messagebox.askyesno("Notetaker", "A transcription is running. Cancel it and quit?\n"
                                                     "(The audio is saved; you can transcribe it later.)"):

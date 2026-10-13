@@ -11,7 +11,8 @@ Single-file mode (any prerecorded audio / video):
 Speakers are separated first; each speaker turn is then transcribed on its own with its own
 language (Whisper otherwise locks one language per 30 s window and drops or translates the other).
 
-Writes transcript.json (data + speaker names) and transcript.md next to the audio.
+Writes <title>.json (data + speaker names) and <title>.md next to the audio, where "<title> - mic.wav"
+gives the title (plain mic.wav -> transcript.*).
 Lines starting with "@progress " are machine-readable progress for the GUI.
 """
 from __future__ import annotations
@@ -293,6 +294,11 @@ def render_text(data: dict) -> str:
     return "\n".join(lines)
 
 
+def session_base(mic: Path) -> str:
+    """'<title> - mic.wav' -> '<title>' (transcript name); a plain 'mic.wav' from older recordings -> 'transcript'."""
+    return re.sub(r"(?:\s*-\s*)?mic$", "", mic.stem, flags=re.I).strip() or "transcript"
+
+
 def save(data: dict, json_path: Path) -> Path:
     json_path.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
     md_path = json_path.with_suffix(".md")
@@ -313,7 +319,7 @@ def run(args: argparse.Namespace) -> Path:
         mic_audio, sys_audio = load_audio(Path(args.mic)), load_audio(Path(args.system))
         duration = max(len(mic_audio), len(sys_audio)) / SR
         out_dir = Path(args.out or Path(args.mic).parent)
-        json_path = out_dir / "transcript.json"
+        json_path = out_dir / f"{session_base(Path(args.mic))}.json"
         sources = [Path(args.mic).name, Path(args.system).name]
         recorded = datetime.fromtimestamp(Path(args.mic).stat().st_mtime - duration)
     else:

@@ -45,7 +45,7 @@ with *Change…* next to *You*) and where to save recordings (change later under
    If Teams plays to your headset but Windows' default is the laptop speakers, pick the headset here.
 3. **Other speakers:** leave on *auto*. Set a number only if auto merges or splits people; in tests a fixed
    count was not better than auto. *1* skips separation.
-4. **● Record** starts. While recording the title field is already free for the next one, and the button
+4. **● Record** starts. During a recording the button
    becomes **● New recording**: it saves the current recording, starts its transcript and starts the next
    recording at once. **■ Stop** ends recording. Watch the two level bars: both should move when the
    respective side talks.
@@ -54,18 +54,20 @@ with *Change…* next to *You*) and where to save recordings (change later under
 6. **Copy transcript** puts the latest transcript on the clipboard as plain text, one line per
    utterance (`[00:00:09] Speaker 1: …`), ready to paste into Word, OneNote or a mail.
 
-Each recording gets a folder named after its title under *Save to* (a second one with the same title gets ` (2)`):
+While recording, files go to a temporary `2026 10 13 - 1405 (recording)` folder. When the recording ends
+(**Stop**, **New recording** or closing the app), the folder and files are named after what is in *Title*
+at that moment, so you can type or fix the title during the call. A second recording with the same title
+gets ` (2)`:
 
 ```
-2026 10 13 - Call Francis\
-    mic.wav            your side
-    system.wav         the other side
-    transcript.md      readable transcript
-    transcript.json    same data + speaker names (used for renaming)
+2026 10 13 - Call Francis    2026 10 13 - Call Francis - mic.wav       your side
+    2026 10 13 - Call Francis - system.wav    the other side
+    2026 10 13 - Call Francis.md              readable transcript
+    2026 10 13 - Call Francis.json            same data + speaker names (used for renaming)
 ```
 
-**Transcribe file…** takes any audio/video file and asks how many voices are in it. Choosing a `mic.wav`
-from a Notetaker folder re-runs that recording in two-track mode (e.g. after the Hugging Face login).
+**Transcribe file…** takes any audio/video file and asks how many voices are in it. Choosing the
+`… - mic.wav` of a Notetaker recording re-runs it in two-track mode.
 
 The transcript can go straight into the `onenote` skill in Claude for call notes.
 
