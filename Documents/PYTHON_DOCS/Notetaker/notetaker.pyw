@@ -90,7 +90,9 @@ class App:
         self.ent_title.icursor("end")
         self.root.after(100, self.tick)
         if self.first_run:
-            self.root.after(300, self.ask_save_dir)
+            self.root.after(300, self.first_start)
+        elif not self.cfg["me"]:
+            self.root.after(300, self.ask_name)
 
     # ------------------------------------------------------------------ layout
     def _build(self) -> None:
@@ -110,8 +112,9 @@ class App:
         self.v_dir = tk.StringVar(value=self.cfg["out_dir"])
 
         r = 0
-        ttk.Label(f, text="Your name").grid(row=r, column=0, sticky="w", **pad)
-        ttk.Entry(f, textvariable=self.v_me).grid(row=r, column=1, columnspan=2, sticky="ew", **pad)
+        ttk.Label(f, text="You").grid(row=r, column=0, sticky="w", **pad)
+        ttk.Label(f, textvariable=self.v_me).grid(row=r, column=1, sticky="w", **pad)
+        ttk.Button(f, text="Change...", width=10, command=self.ask_name).grid(row=r, column=2, **pad)
         r += 1
         ttk.Label(f, text="Title").grid(row=r, column=0, sticky="w", **pad)
         self.ent_title = ttk.Entry(f, textvariable=self.v_title)
@@ -183,6 +186,7 @@ class App:
         ttk.Button(btns, text="Transcribe file...", command=self.transcribe_file).pack(side="left", padx=6)
         self.btn_open = ttk.Button(btns, text="Open transcript", command=self.open_transcript, state="disabled")
         self.btn_open.pack(side="left", padx=6)
+        ttk.Button(btns, text="Copy transcript", command=self.copy_transcript).pack(side="left", padx=6)
         ttk.Button(btns, text="Rename speakers...", command=self.rename_speakers).pack(side="left", padx=6)
         ttk.Button(btns, text="Open folder", command=lambda: self._startfile(self.v_dir.get())).pack(side="left", padx=6)
         r += 1
@@ -230,7 +234,19 @@ class App:
         if path and Path(path).exists():
             os.startfile(str(path))
 
-    # ------------------------------------------------------------------ recording
+    # ------------------------------------------------------------------ settings
+    def first_start(self) -> None:
+        self.ask_name()
+        self.ask_save_dir()
+
+    def ask_name(self) -> None:
+        """Your name labels the microphone track; asked once, changeable via 'Change...'."""
+        name = simpledialog.askstring("Notetaker", "Your name (labels everything you say on your microphone):",
+                                      initialvalue=self.v_me.get(), parent=self.root)
+        if name and name.strip():
+            self.v_me.set(name.strip())
+            self.remember()
+
     def ask_save_dir(self) -> None:
         """First start: choose where recordings and transcripts go."""
         messagebox.showinfo("Notetaker", "Where should Notetaker save your recordings and transcripts?\n\n"
@@ -375,13 +391,27 @@ class App:
         if self.last_json:
             self._startfile(self.last_json.with_suffix(".md"))
 
+    def pick_transcript(self) -> Path | None:
+        """The latest transcript, or one chosen from disk."""
+        if self.last_json and self.last_json.exists():
+            return self.last_json
+        f = filedialog.askopenfilename(title="Transcript", initialdir=self.v_dir.get(), filetypes=[("Transcript", "*.json")])
+        return Path(f) if f else None
+
+    def copy_transcript(self) -> None:
+        path = self.pick_transcript()
+        if not path:
+            return
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.root.clipboard_clear()
+        self.root.clipboard_append(transcribe.render_text(data))
+        self.root.update()  # hand the text to Windows now, so it survives closing the app
+        self.lbl_status.configure(text=f"Copied: {path.parent.name} ({len(data['utterances'])} lines), paste with Ctrl+V")
+
     def rename_speakers(self) -> None:
-        path = self.last_json
-        if not path or not path.exists():
-            f = filedialog.askopenfilename(title="Transcript", initialdir=self.v_dir.get(), filetypes=[("Transcript", "*.json")])
-            if not f:
-                return
-            path = Path(f)
+        path = self.pick_transcript()
+        if not path:
+            return
         data = json.loads(path.read_text(encoding="utf-8"))
 
         win = tk.Toplevel(self.root)

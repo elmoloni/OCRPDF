@@ -36,21 +36,23 @@ After the first download the model is cached and runs offline.
 
 ## Use
 
-Start `Notetaker.bat`. On the first start it asks where to save recordings (change later under *Save to*).
+Start `Notetaker.bat`. On the first start it asks for your name (labels your microphone track; change it
+with *Change…* next to *You*) and where to save recordings (change later under *Save to*).
 
-1. Enter your name once (remembered).
-2. **Title:** starts with today's date (`2026 10 13 - `); type the rest, e.g. `2026 10 13 - Call Francis`.
+1. **Title:** starts with today's date (`2026 10 13 - `); type the rest, e.g. `2026 10 13 - Call Francis`.
    Left as just the date, the time is used (`2026 10 13 - 1405`).
-3. **Microphone:** the mic you speak into. **PC sound:** the device your call app plays to.
+2. **Microphone:** the mic you speak into. **PC sound:** the device your call app plays to.
    If Teams plays to your headset but Windows' default is the laptop speakers, pick the headset here.
-4. **Other speakers:** leave on *auto*. Set a number only if auto merges or splits people; in tests a fixed
+3. **Other speakers:** leave on *auto*. Set a number only if auto merges or splits people; in tests a fixed
    count was not better than auto. *1* skips separation.
-5. **● Record** starts. While recording the title field is already free for the next one, and the button
+4. **● Record** starts. While recording the title field is already free for the next one, and the button
    becomes **● New recording**: it saves the current recording, starts its transcript and starts the next
    recording at once. **■ Stop** ends recording. Watch the two level bars: both should move when the
    respective side talks.
-6. **Rename speakers…** replaces "Speaker 1" etc. with names; the first sentence of each speaker is shown
+5. **Rename speakers…** replaces "Speaker 1" etc. with names; the first sentence of each speaker is shown
    as a hint.
+6. **Copy transcript** puts the latest transcript on the clipboard as plain text, one line per
+   utterance (`[00:00:09] Speaker 1: …`), ready to paste into Word, OneNote or a mail.
 
 Each recording gets a folder named after its title under *Save to* (a second one with the same title gets ` (2)`):
 

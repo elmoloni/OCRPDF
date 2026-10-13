@@ -280,6 +280,19 @@ def render_markdown(data: dict) -> str:
     return "\n".join(lines)
 
 
+def render_text(data: dict) -> str:
+    """Plain text for pasting into Word / OneNote / mails: one line per utterance, no Markdown."""
+    names = data["speakers"]
+    lines = [
+        data.get("title") or "Transcript",
+        f"Recorded {data.get('recorded', '')}, duration {fmt_ts(data.get('duration', 0))}, "
+        f"speakers: {', '.join(names[k] for k in names)}",
+        "",
+    ]
+    lines += [f"[{fmt_ts(u['start'])}] {names.get(u['speaker'], u['speaker'])}: {u['text']}" for u in data["utterances"]]
+    return "\n".join(lines)
+
+
 def save(data: dict, json_path: Path) -> Path:
     json_path.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
     md_path = json_path.with_suffix(".md")
