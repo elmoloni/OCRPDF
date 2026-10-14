@@ -190,6 +190,35 @@ def diarize(audio, device: str, num_speakers: int | None) -> list[tuple[float, f
     return turns
 
 
+def split_long_turns(audio, turns: list[tuple[float, float, str]]) -> list[tuple[float, float, str]]:
+    """Cut turns longer than MAX_TURN (monologues) at short pauses, so no Whisper window loses its tail.
+    Silero VAD with max_speech_duration_s splits at the last pause before the limit; without any pause, hard cut."""
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+    out: list[tuple[float, float, str]] = []
+    for s, e, spk in turns:
+        if e - s <= MAX_TURN:
+            out.append((s, e, spk))
+            continue
+        a = audio[int(s * SR):int(e * SR)]
+        pieces = get_speech_timestamps(a, VadOptions(min_silence_duration_ms=100, speech_pad_ms=100,
+                                                     max_speech_duration_s=MAX_TURN - 1)) or [{"start": 0, "end": len(a)}]
+        chunk: list[float] = []  # pauses split finely; re-join pieces up to MAX_TURN so cuts happen only where needed
+        for piece in pieces:
+            ps, pe = s + piece["start"] / SR, min(e, s + piece["end"] / SR)
+            if chunk and pe - chunk[0] <= MAX_TURN:
+                chunk[1] = pe
+                continue
+            if chunk:
+                out.append((chunk[0], chunk[1], spk))
+            while pe - ps > MAX_TURN:
+                out.append((ps, ps + MAX_TURN, spk))
+                ps += MAX_TURN
+            chunk = [ps, pe]
+        if chunk:
+            out.append((chunk[0], chunk[1], spk))
+    return out
+
+
 def half_precision_embeddings(pipeline) -> None:
     """Run the speaker-embedding ResNet in float16: ~2x faster, same speakers (99% of frames identical in tests).
     The filterbank in front of it must stay float32, or all voices collapse into one."""
@@ -479,7 +508,9 @@ def run(args: argparse.Namespace) -> Path:
     import numpy as np
     off = len(mic_audio) / SR + 1.0 if two_track else 0.0
     audio = np.concatenate([mic_audio, np.zeros(SR, np.float32), sys_audio]) if two_track else sys_audio
-    turns = group_turns(my_turns) + [(s + off, e + off, k) for s, e, k in group_turns(other_turns)]
+    my_chunks = split_long_turns(mic_audio, group_turns(my_turns)) if two_track else []
+    other_chunks = split_long_turns(sys_audio, group_turns(other_turns))
+    turns = my_chunks + [(s + off, e + off, k) for s, e, k in other_chunks]
     model = load_whisper(args.model, device)
     lid_model = load_whisper(LID_MODEL, device) if args.language == "auto" else None
     lap("load Whisper")
