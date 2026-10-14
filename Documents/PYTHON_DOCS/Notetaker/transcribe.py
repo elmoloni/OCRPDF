@@ -24,6 +24,7 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -31,7 +32,16 @@ SR = 16000
 ME = "ME"
 OTHERS = "SPEAKER_00"     # label for the other side when it is not separated
 LANGS = ("de", "en")       # "auto" chooses between these per turn
-MAX_TURN = 30.0            # seconds of audio per Whisper call
+MAX_TURN = 29.0            # seconds per Whisper clip (30 s window minus padding)
+PAD = 0.2                  # seconds of context around each turn
+BATCH = 8                  # Whisper windows per GPU call (fits the 4 GB RTX A500 next to the model)
+LID_BATCH = 32             # turns per language-detection call (small model)
+# Packing several turns per 30 s window: 2 s gaps + Whisper timestamp tokens gave 0.6% word error rate vs 2.9%
+# for one turn per window, at half the time (10-min DE/EN test call); without timestamps Whisper skips turns.
+GAP = 2.0                  # seconds of silence between turns packed into one window
+PACK_SECONDS = 29.4        # fill Whisper windows up to this length
+WITHOUT_TIMESTAMPS = False
+LID_MODEL = "base"         # language detection only
 TURN_GAP = 1.0             # same-speaker turns closer than this are transcribed together
 MIN_TURN = 0.8             # shorter diarization turns are handed to the neighbouring speaker
 LANG_MIN = 2.0             # shorter turns keep the speaker's previous language unless detection is clear
@@ -42,6 +52,17 @@ HALLUCINATION = re.compile(r"untertitel|amara\.org|thanks for watching|vielen da
 
 def log(msg: str) -> None:
     print(msg, flush=True)
+
+
+class Lap:
+    """Log how long each step took (shown in the app log)."""
+    def __init__(self):
+        self.t = time.time()
+
+    def __call__(self, what: str) -> None:
+        now = time.time()
+        log(f"  [{what}: {now - self.t:.1f} s]")
+        self.t = now
 
 
 def progress(stage: str, frac: float) -> None:
@@ -80,6 +101,27 @@ def pick_device(requested: str) -> str:
             raise
         log(f"GPU not usable ({e}), running on CPU")
         return "cpu"
+
+
+def wait_for_gpu():
+    """One transcription at a time across all Notetaker windows: two would not fit into 4 GB of GPU memory.
+    The lock is a byte-range lock on a file; Windows releases it when this process ends, even on a crash."""
+    import msvcrt
+    path = Path.home() / ".notetaker" / "gpu.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(path, "a+b")
+    waited = False
+    while True:
+        try:
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            return f  # keep the handle open for the lifetime of the process
+        except OSError:
+            if not waited:
+                log("Waiting for another transcription to finish ...")
+                progress("wait", 0.0)
+                waited = True
+            time.sleep(2)
 
 
 def free_gpu() -> None:
@@ -133,6 +175,8 @@ def diarize(audio, device: str, num_speakers: int | None) -> list[tuple[float, f
     if pipeline is None:
         raise RuntimeError("model download refused: accept its terms on huggingface.co and run `hf auth login`")
     pipeline.to(torch.device(device))
+    if device == "cuda":
+        half_precision_embeddings(pipeline)
 
     kwargs = {"num_speakers": num_speakers} if num_speakers else {}
     log("Separating speakers" + (f" ({num_speakers})" if num_speakers else " (count auto)") + " ...")
@@ -144,6 +188,23 @@ def diarize(audio, device: str, num_speakers: int | None) -> list[tuple[float, f
     del pipeline
     free_gpu()
     return turns
+
+
+def half_precision_embeddings(pipeline) -> None:
+    """Run the speaker-embedding ResNet in float16: ~2x faster, same speakers (99% of frames identical in tests).
+    The filterbank in front of it must stay float32, or all voices collapse into one."""
+    import torch
+    resnet = getattr(getattr(getattr(pipeline, "_embedding", None), "model_", None), "resnet", None)
+    if resnet is None:
+        return
+    forward = resnet.forward
+
+    def half_forward(*args, **kwargs):
+        with torch.autocast("cuda", dtype=torch.float16):
+            out = forward(*args, **kwargs)
+        return tuple(o.float() if torch.is_tensor(o) else o for o in out) if isinstance(out, tuple) else out.float()
+
+    resnet.forward = half_forward
 
 
 def group_turns(turns: list[tuple[float, float, str]]) -> list[tuple[float, float, str]]:
@@ -174,41 +235,106 @@ def load_whisper(model_name: str, device: str):
     from faster_whisper import WhisperModel
     compute = "int8_float16" if device == "cuda" else "int8"
     log(f"Loading Whisper '{model_name}' on {device} ({compute}) ...")
-    return WhisperModel(model_name, device=device, compute_type=compute)
+    # cpu_threads: faster-whisper defaults to 4; use every core (feature extraction, and all of it on CPU)
+    return WhisperModel(model_name, device=device, compute_type=compute, cpu_threads=os.cpu_count() or 4)
 
 
-def pick_language(model, chunk, fallback: str) -> str:
-    _, _, probs = model.detect_language(chunk)
-    p = dict(probs)
-    best = max(LANGS, key=lambda lang: p.get(lang, 0.0))
-    if len(chunk) < LANG_MIN * SR and p.get(best, 0.0) < 0.8:
-        return fallback
-    return best
+def turn_clips(audio, turns) -> list[tuple[float, float]]:
+    """Audio span per turn, padded a little so first and last syllables are not clipped."""
+    total = len(audio) / SR
+    return [(max(0.0, s - PAD), min(total, e + PAD)) for s, e, _ in turns]
 
 
-def transcribe_turns(model, audio, turns, language: str, stage: str) -> list[dict]:
-    """One Whisper call per speaker turn, each with its own language."""
-    lines: list[dict] = []
-    last_lang: dict[str, str] = {}
-    used: dict[str, int] = {}
-    for i, (s, e, spk) in enumerate(turns):
-        chunk = audio[int(max(0.0, s - 0.2) * SR):int((e + 0.2) * SR)]
-        if language == "auto":
-            lang = pick_language(model, chunk, last_lang.get(spk) or next(iter(last_lang.values()), LANGS[0]))
-            last_lang[spk] = lang
+def detect_languages(lid_model, audio, turns, clips) -> list[str]:
+    """German or English per turn, from the small Whisper 'base' model (batched; ~100x cheaper than turbo)."""
+    import numpy as np
+    from faster_whisper.audio import pad_or_trim
+    probs: list[dict[str, float]] = []
+    for b in range(0, len(clips), LID_BATCH):
+        feats = np.stack([pad_or_trim(lid_model.feature_extractor(audio[int(s * SR):int(e * SR)])[..., :-1])
+                          for s, e in clips[b:b + LID_BATCH]])
+        for res in lid_model.model.detect_language(lid_model.encode(feats)):
+            probs.append({tok[2:-2]: pr for tok, pr in res})
+        progress("language", min(1.0, (b + LID_BATCH) / len(clips)))
+    langs: list[str] = []
+    last: dict[str, str] = {}
+    for (s, e, spk), p in zip(turns, probs):
+        best = max(LANGS, key=lambda lang: p.get(lang, 0.0))
+        if e - s < LANG_MIN and p.get(best, 0.0) < 0.8:  # too short to tell: keep the speaker's language
+            best = last.get(spk) or next(iter(last.values()), LANGS[0])
+        last[spk] = best
+        langs.append(best)
+    return langs
+
+
+def pack_windows(idx: list[int], clips) -> list[list[int]]:
+    """Fill 30 s Whisper windows with consecutive same-language turns (the encoder costs the same for 3 s or 30 s)."""
+    windows: list[list[int]] = []
+    used = MAX_TURN + 1
+    for i in idx:
+        dur = clips[i][1] - clips[i][0]
+        if windows and used + GAP + dur <= PACK_SECONDS:
+            windows[-1].append(i)
+            used += GAP + dur
         else:
-            lang = language
-        segments, _ = model.transcribe(chunk, language=lang, beam_size=5, condition_on_previous_text=False,
-                                       vad_filter=False)
-        # Skip silence guesses and repetition loops ("the link to the link to the link")
-        text = " ".join(seg.text.strip() for seg in segments
-                        if not (seg.no_speech_prob > 0.6 and seg.avg_logprob < -0.8) and seg.compression_ratio <= 2.4).strip()
+            windows.append([i])
+            used = dur
+    return windows
+
+
+def transcribe_turns(model, lid_model, audio, turns, language: str) -> list[dict]:
+    """Every turn transcribed in its own language. Same-language turns are packed into full windows with
+    GAP seconds of silence between them, transcribed in batches, and split back by word timestamps."""
+    import numpy as np
+    from faster_whisper import BatchedInferencePipeline
+    if not turns:
+        return []
+    turns = sorted(turns)
+    clips = turn_clips(audio, turns)
+    langs = detect_languages(lid_model, audio, turns, clips) if language == "auto" else [language] * len(turns)
+    pipe = BatchedInferencePipeline(model)
+    words: dict[int, list[str]] = {i: [] for i in range(len(turns))}
+    plan = {lang: pack_windows([i for i, l in enumerate(langs) if l == lang], clips) for lang in sorted(set(langs))}
+    n_windows = sum(len(w) for w in plan.values())
+    done = 0
+    for lang, windows in plan.items():
+        # Synthetic audio: windows one after another; remember where each turn sits in it
+        parts, places, wins, pos = [], [], [], 0.0
+        for w in windows:
+            w_start = pos
+            for k, i in enumerate(w):
+                if k:
+                    parts.append(np.zeros(int(GAP * SR), np.float32))
+                    pos += GAP
+                chunk = audio[int(clips[i][0] * SR):int(clips[i][1] * SR)]
+                parts.append(chunk)
+                places.append((pos, pos + len(chunk) / SR, i))
+                pos += len(chunk) / SR
+            wins.append({"start": w_start, "end": pos})
+            parts.append(np.zeros(SR, np.float32))
+            pos += 1.0
+        syn = np.concatenate(parts)
+        segments, _ = pipe.transcribe(syn, language=lang, vad_filter=False, batch_size=BATCH, beam_size=5,
+                                      condition_on_previous_text=False, without_timestamps=WITHOUT_TIMESTAMPS,
+                                      word_timestamps=True, clip_timestamps=wins)
+        for seg in segments:
+            done += 1
+            progress("text", done / n_windows)
+            # Skip silence guesses and repetition loops ("the link to the link to the link")
+            if (seg.no_speech_prob > 0.6 and seg.avg_logprob < -0.8) or seg.compression_ratio > 2.4:
+                continue
+            for w in (seg.words or [type("W", (), {"start": seg.start, "end": seg.end, "word": seg.text})]):
+                mid = (w.start + w.end) / 2
+                i = min(places, key=lambda pl: 0.0 if pl[0] <= mid <= pl[1] else min(abs(pl[0] - mid), abs(pl[1] - mid)))[2]
+                words[i].append(w.word)
+    progress("text", 1.0)
+    lines: list[dict] = []
+    for i, (s, e, spk) in enumerate(turns):
+        text = "".join(words[i]).strip()
         if text and not (HALLUCINATION.search(text) and len(text) < 80):
-            lines.append({"start": s, "end": e, "speaker": spk, "text": text, "lang": lang})
-            used[lang] = used.get(lang, 0) + 1
-        progress(stage, (i + 1) / len(turns))
-    if used:
-        log("  turns per language: " + ", ".join(f"{k} {v}" for k, v in sorted(used.items())))
+            lines.append({"start": s, "end": e, "speaker": spk, "text": text, "lang": langs[i]})
+    log("  turns per language: " + ", ".join(f"{lang} {langs.count(lang)}" for lang in sorted(set(langs)))
+        + f"; {n_windows} Whisper windows for {len(turns)} turns")
     return lines
 
 
@@ -311,12 +437,15 @@ def save(data: dict, json_path: Path) -> Path:
 # ------------------------------------------------------------------------------------------
 def run(args: argparse.Namespace) -> Path:
     t_start = time.time()
+    gpu_lock = wait_for_gpu()  # noqa: F841 (held until exit)
+    lap = Lap()
     device = pick_device(args.device)
     n_spk = args.speakers or None
     two_track = bool(args.mic)
 
     if two_track:
-        mic_audio, sys_audio = load_audio(Path(args.mic)), load_audio(Path(args.system))
+        with ThreadPoolExecutor(2) as ex:  # decoding and VAD release the GIL: both tracks at once
+            mic_audio, sys_audio = ex.map(load_audio, (Path(args.mic), Path(args.system)))
         duration = max(len(mic_audio), len(sys_audio)) / SR
         out_dir = Path(args.out or Path(args.mic).parent)
         json_path = out_dir / f"{session_base(Path(args.mic))}.json"
@@ -330,29 +459,37 @@ def run(args: argparse.Namespace) -> Path:
         sources = [Path(args.file).name]
         recorded = datetime.fromtimestamp(Path(args.file).stat().st_mtime)
     log(f"Audio: {fmt_ts(duration)}")
+    lap("load audio")
 
-    # 1. Who speaks when (diarization first, so every Whisper call sees one speaker and one language)
-    my_turns = speech_turns(mic_audio, ME) if two_track else []
-    other_turns = speech_turns(sys_audio, OTHERS)
+    # 1. Who speaks when (diarization first, so every Whisper clip holds one speaker and one language)
+    with ThreadPoolExecutor(2) as ex:
+        mine_f = ex.submit(speech_turns, mic_audio, ME) if two_track else None
+        other_turns = speech_turns(sys_audio, OTHERS)
+        my_turns = mine_f.result() if mine_f else []
+    lap("voice activity")
     if other_turns and n_spk != 1:
         try:
             other_turns = diarize(sys_audio, device, n_spk)
         except Exception as e:
             log(f"WARNING: speaker separation failed, the other side stays one speaker: {e}")
+        lap("speaker separation")
     log(f"Speech turns: {len(my_turns)} mic, {len(other_turns)} " + ("PC sound" if two_track else "file"))
 
-    # 2. What was said
+    # 2. What was said: both tracks in one batched run (PC sound placed after the mic audio plus 1 s of silence)
+    import numpy as np
+    off = len(mic_audio) / SR + 1.0 if two_track else 0.0
+    audio = np.concatenate([mic_audio, np.zeros(SR, np.float32), sys_audio]) if two_track else sys_audio
+    turns = group_turns(my_turns) + [(s + off, e + off, k) for s, e, k in group_turns(other_turns)]
     model = load_whisper(args.model, device)
-    mine: list[dict] = []
-    if my_turns:
-        log("Transcribing your microphone ...")
-        mine = transcribe_turns(model, mic_audio, group_turns(my_turns), args.language, "mic")
-    others: list[dict] = []
-    if other_turns:
-        log("Transcribing " + ("the other side ..." if two_track else "file ..."))
-        others = transcribe_turns(model, sys_audio, group_turns(other_turns), args.language, "system")
-    del model
+    lid_model = load_whisper(LID_MODEL, device) if args.language == "auto" else None
+    lap("load Whisper")
+    log(f"Transcribing {len(turns)} turns ...")
+    lines = transcribe_turns(model, lid_model, audio, turns, args.language)
+    lap("transcribe")
+    del model, lid_model
     free_gpu()
+    mine = [ln for ln in lines if ln["speaker"] == ME]
+    others = [dict(ln, start=ln["start"] - off, end=ln["end"] - off) for ln in lines if ln["speaker"] != ME]
 
     if mine and others:
         mine, dropped = drop_echo(mine, others)

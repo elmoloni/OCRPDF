@@ -84,8 +84,14 @@ The transcript can go straight into the `onenote` skill in Claude for call notes
   system track says at the same moment are dropped automatically, but headphones give cleaner results.
 - **Language:** *Auto* re-detects the language per segment, so mixed German/English calls work.
   If a call is entirely in one language, choose it: slightly more accurate.
-- **Speed:** on the RTX A500 a 1-hour call takes a few minutes. Without a GPU it falls back to CPU
-  (several times slower). *medium* / *small* models are faster but less accurate.
+- **Speed:** on the RTX A500 a call transcribes in about a fifth of its length (10-min test call: 2 min;
+  a 1-hour call roughly 12 min). Most of that is speaker separation; the log shows the time per step.
+  Without a GPU it falls back to the CPU, using all cores, several times slower. *medium* / *small* models
+  are faster but less accurate. The first transcription downloads the models (~1,8 GB, once).
+- **Back-to-back calls:** use **● New recording** in one window: it saves the call that just ended, queues
+  its transcript and keeps recording the next one. Several windows also work: each recording gets its own
+  folder, and transcriptions take turns on the GPU (a second one shows *Waiting for the transcription in
+  another Notetaker window*), since two at once would not fit into the GPU's 4 GB.
 - **Speaker separation is not perfect:** overlapping speech, similar voices and compressed call audio can
   put a sentence under the wrong speaker. Telling it the number of speakers helps most.
 - **Consent:** in Germany, recording a non-public conversation without the participants' consent is a

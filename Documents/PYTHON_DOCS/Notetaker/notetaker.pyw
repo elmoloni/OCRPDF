@@ -27,7 +27,8 @@ import transcribe  # noqa: E402  (heavy libraries load only inside its functions
 CONFIG = Path.home() / ".notetaker" / "config.json"
 LANGUAGES = {"Auto (DE/EN mixed)": "auto", "Deutsch": "de", "English": "en"}
 MODELS = ["large-v3-turbo", "large-v3", "medium", "small"]
-STAGES = {"mic": "Transcribing your mic", "system": "Transcribing the other side", "diarize": "Separating speakers"}
+STAGES = {"wait": "Waiting for the transcription in another Notetaker window", "diarize": "Separating speakers",
+          "language": "Detecting languages", "text": "Transcribing"}
 
 
 def documents_dir() -> Path:
@@ -60,11 +61,34 @@ def date_prefix() -> str:
     return datetime.now().strftime("%Y %m %d - ")
 
 
-def unique_folder(parent: Path, name: str) -> Path:
-    folder, n = parent / name, 2
-    while folder.exists():
-        folder, n = parent / f"{name} ({n})", n + 1
-    return folder
+def candidates(parent: Path, name: str):
+    yield parent / name
+    n = 2
+    while True:
+        yield parent / f"{name} ({n})"
+        n += 1
+
+
+def claim_folder(parent: Path, name: str) -> Path:
+    """Create a new folder; mkdir fails if another window got there first, so two windows never share one."""
+    parent.mkdir(parents=True, exist_ok=True)
+    for folder in candidates(parent, name):
+        try:
+            folder.mkdir()
+            return folder
+        except FileExistsError:
+            continue
+
+
+def rename_unique(src: Path, name: str) -> Path:
+    """Rename to name, or 'name (2)', 'name (3)' ... if taken (also by another window at the same moment)."""
+    for folder in candidates(src.parent, name):
+        if folder == src:
+            return src
+        try:
+            return src.rename(folder)
+        except FileExistsError:
+            continue
 
 
 def level_to_meter(rms: float) -> float:
@@ -269,7 +293,7 @@ class App:
         """Record into a temporary folder; it gets its name from the Title field when the recording ends."""
         self.remember()
         self.rec_started = datetime.now()
-        folder = unique_folder(Path(self.v_dir.get()), self.rec_started.strftime("%Y %m %d - %H%M (recording)"))
+        folder = claim_folder(Path(self.v_dir.get()), self.rec_started.strftime("%Y %m %d - %H%M (recording)"))
         try:
             self.rec = DualRecorder(folder, self.v_mic.get() or None, self.v_out.get() or None)
             self.rec.start()
@@ -305,7 +329,7 @@ class App:
             title = self.rec_started.strftime("%Y %m %d - %H%M")
         folder = mic.parent
         try:
-            folder = folder.rename(unique_folder(folder.parent, title))
+            folder = rename_unique(folder, title)
             mic = (folder / mic.name).rename(folder / f"{folder.name} - mic.wav")
             system = (folder / system.name).rename(folder / f"{folder.name} - system.wav")
         except OSError as e:  # e.g. a file opened by another program; keep whatever names stuck
